@@ -36,6 +36,9 @@ class DocState(TypedDict, total=False):
     # --- extract ---
     fields: dict[str, Any]
     attempts: int
+    # How many extraction passes this document has earned, derived from the
+    # classification confidence at classify time (see agents.attempt_budget).
+    retry_budget: int
     # --- validate ---
     errors: list[str]
     warnings: list[str]

@@ -11,11 +11,20 @@ plain code the tests can pin exactly.
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Any
 
 from .engine import Engine
 from .state import STATUS_NEEDS_REVIEW, STATUS_OK, DocState
+
+# Ceiling on extraction passes for any single document.
+DEFAULT_MAX_ATTEMPTS = 2
+
+# Classifications weaker than this are not trusted enough to extract against.
+# The rule-based engine reports a type's share of all keyword hits, so a score
+# below roughly a third means the runner-up types were nearly as plausible.
+DEFAULT_MIN_CONFIDENCE = 0.35
 
 # Fields every recognized type must carry to be considered complete. Demographic
 # fields (mrn, dob) are treated as warnings, not errors — a document is still
@@ -32,17 +41,62 @@ _DATE_RE = re.compile(r"^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$")
 
 
 # --------------------------------------------------------------------------- #
+# Confidence-weighted retry budget
+# --------------------------------------------------------------------------- #
+
+
+def attempt_budget(
+    confidence: float,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    min_confidence: float = DEFAULT_MIN_CONFIDENCE,
+) -> int:
+    """How many extraction passes a classification of this confidence has earned.
+
+    The retry pass is deliberately *more lenient* than the first one, which is
+    only a good trade when we are confident the document was typed correctly.
+    Spending a lenient pass on a probably-misclassified document manufactures
+    plausible-but-wrong fields — strictly worse than an honest ``needs_review``.
+    So the budget scales with confidence:
+
+    * below ``min_confidence`` → 0 passes; the document goes straight to review
+    * otherwise → ``ceil(confidence * max_attempts)``, at least one pass
+
+    With the default ceiling of 2, that means a document classified at 0.5 or
+    below gets a single strict pass, and only a confident classification earns
+    the lenient retry.
+    """
+    if confidence < min_confidence:
+        return 0
+    return max(1, math.ceil(confidence * max_attempts))
+
+
+# --------------------------------------------------------------------------- #
 # Nodes
 # --------------------------------------------------------------------------- #
 
 
-def classify_node(state: DocState, engine: Engine) -> dict[str, Any]:
+def classify_node(
+    state: DocState,
+    engine: Engine,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    min_confidence: float = DEFAULT_MIN_CONFIDENCE,
+) -> dict[str, Any]:
     doc_type, confidence = engine.classify(state["raw_text"])
-    return {
+    budget = attempt_budget(confidence, max_attempts, min_confidence)
+    out: dict[str, Any] = {
         "doc_type": doc_type,
         "classification_confidence": confidence,
-        "trace": [f"classify → {doc_type} (confidence {confidence:.2f})"],
+        "retry_budget": budget,
+        "trace": [f"classify → {doc_type} (confidence {confidence:.2f}, budget {budget})"],
     }
+    # A recognized type we do not actually trust is an error, not a silent pass:
+    # it carries the document to needs_review with the reason attached.
+    if budget == 0 and doc_type != "unknown":
+        out["errors"] = [
+            f"classification confidence {confidence:.2f} below threshold {min_confidence:.2f}"
+        ]
+        out["trace"].append("classify → below confidence threshold, skipping extraction")
+    return out
 
 
 def extract_node(state: DocState, engine: Engine) -> dict[str, Any]:
@@ -99,14 +153,21 @@ def summarize_node(state: DocState, engine: Engine) -> dict[str, Any]:
 
 
 def route_after_classify(state: DocState) -> str:
-    """An unrecognized document has nothing to extract — send it straight to
-    summarize, where it will be flagged for review."""
-    return "summarize" if state.get("doc_type") == "unknown" else "extract"
+    """Send a document to extraction only if it earned a pass.
+
+    Two kinds of document skip straight to summarize (and therefore review): one
+    that matched nothing (``unknown``), and one whose classification was too weak
+    to trust — both arrive with a ``retry_budget`` of 0.
+    """
+    if state.get("doc_type") == "unknown" or state.get("retry_budget", 0) < 1:
+        return "summarize"
+    return "extract"
 
 
-def route_after_validate(state: DocState, max_attempts: int) -> str:
-    """Loop back for another extraction pass while there are errors and attempts
-    remain; otherwise finish. This is the self-correcting core of the pipeline."""
-    if state.get("errors") and state.get("attempts", 0) < max_attempts:
+def route_after_validate(state: DocState) -> str:
+    """Loop back for another extraction pass while there are errors and the
+    document's confidence-weighted budget still has room; otherwise finish. This
+    is the self-correcting core of the pipeline."""
+    if state.get("errors") and state.get("attempts", 0) < state.get("retry_budget", 0):
         return "extract"
     return "summarize"
