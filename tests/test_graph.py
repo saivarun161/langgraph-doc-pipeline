@@ -41,6 +41,33 @@ def test_exhausted_retries_flag_for_review():
     assert any("plan" in e for e in result["errors"])
 
 
+def test_low_confidence_document_skips_extraction_entirely():
+    # min_confidence of 1.01 makes every classification untrusted, so no document
+    # reaches extraction no matter how well it matches.
+    text = "Chief Complaint: cough\nAssessment: bronchitis\nPlan: rest\nPatient Name: Sam Roe"
+    result = run_document(text, min_confidence=1.01)
+    assert result["doc_type"] == "clinical_note"
+    assert result.get("attempts", 0) == 0
+    assert result["status"] == "needs_review"
+    assert any("below threshold" in e for e in result["errors"])
+
+
+def test_confident_document_still_extracts_under_the_default_threshold():
+    text = "Chief Complaint: cough\nAssessment: bronchitis\nPlan: rest\nPatient Name: Sam Roe"
+    result = run_document(text)
+    assert result["retry_budget"] == 2
+    assert result["status"] == "ok"
+
+
+def test_retry_budget_scales_with_max_attempts():
+    # ref-01 classifies at 0.75 confidence, so it earns ceil(0.75 * ceiling)
+    # passes rather than the full ceiling.
+    ref = next(d for d in load_samples() if d["id"] == "ref-01")
+    assert run_document(ref["text"])["classification_confidence"] == 0.75
+    assert run_document(ref["text"], max_attempts=4)["retry_budget"] == 3
+    assert run_document(ref["text"], max_attempts=2)["retry_budget"] == 2
+
+
 def test_trace_accumulates_across_nodes():
     result = run_document(load_samples()[0]["text"])
     kinds = [step.split(" ")[0] for step in result["trace"]]
