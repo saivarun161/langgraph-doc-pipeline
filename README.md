@@ -11,10 +11,10 @@ It runs with **no API key**: the default reasoning engine is deterministic rule-
 ```text
              ┌───────────────────────────── self-correcting loop ─────────────────────────────┐
              │                                                                                  │
-START ─► classify ─┬─(unknown)──────────────────────────────────────────────────────────► summarize ─► END
+START ─► classify ─┬─(unknown / low confidence)─────────────────────────────────────────► summarize ─► END
                    │                                                                        ▲   │
-                   └─(recognized)─► extract ─► validate ─┬─(errors & attempts remain)─► ────┘   │
-                                       ▲                 └─(clean, or retries exhausted)─────────┘
+                   └─(trusted type)─► extract ─► validate ─┬─(errors & budget remains)─► ──┘   │
+                                       ▲                   └─(clean, or budget spent)──────────┘
                                        │                                                    status:
                                   engine.extract                                       ok | needs_review
                               (rule-based | OpenAI)
@@ -48,7 +48,7 @@ Example output for one document:
     chief_complaint: Shortness of breath on exertion
     ...
   trace:
-    • classify → clinical_note (confidence 1.00)
+    • classify → clinical_note (confidence 1.00, budget 2)
     • extract → 5 field(s): assessment, dob, mrn, patient_name, plan
     • validate → 1 error(s), 0 warning(s)
     • extract (retry 1) → 6 field(s): assessment, chief_complaint, dob, mrn, patient_name, plan
@@ -57,6 +57,50 @@ Example output for one document:
 ```
 
 That trace is the whole point: the first extraction missed the `CC:` abbreviation, validation caught it, and the retry recovered it — automatically.
+
+## Batch runs and metrics
+
+A single document's trace explains that document. A corpus needs different questions answered — what share came out clean, and is the retry loop actually rescuing anything or just burning passes?
+
+```bash
+docpipeline --dir ./inbox --metrics --workers 8
+```
+
+```text
+── batch — 6 document(s) in 0.01s (531.0/s)
+  status:       ok=5  needs_review=1 (17% review rate)
+  types:        clinical_note=2, discharge_summary=1, lab_report=1, referral=1, unknown=1
+  retries:      1 retried, 1 recovered by the retry loop
+  skipped:      1 never reached extraction
+  mean conf:    0.79   mean passes: 1.00
+  completeness: 100% of required fields extracted
+```
+
+`retried` vs `recovered_by_retry` is the pair worth watching: retries that never recover are pure cost, and the gap between them tells you whether to raise `--max-attempts` or tighten `--min-confidence`. The same numbers are available as data:
+
+```python
+from docpipeline import run_batch
+
+batch = run_batch(docs, workers=8)          # results stay in input order
+batch.metrics.review_rate                   # 0.1667
+batch.metrics.as_dict()                     # JSON-ready, with derived rates
+```
+
+Add `--json --metrics` to get `{"results": [...], "metrics": {...}}` from the CLI. Without `--metrics` the JSON stays a bare list, so existing consumers are unaffected.
+
+## Confidence-weighted routing
+
+Extraction passes are **earned, not granted**. The retry pass is deliberately more lenient than the first — it accepts `CC:` for chief complaint, `Impression:` for assessment — and that leniency is only a good trade when the document was typed correctly to begin with. Spending it on a probably-misclassified document manufactures plausible-but-wrong fields, which is strictly worse than an honest `needs_review`.
+
+So the budget scales with the classifier's confidence:
+
+| Confidence | Passes (ceiling 2) | Behavior |
+|---|---|---|
+| `< 0.35` | 0 | never extracted; routed to review with the reason attached |
+| `0.35 – 0.50` | 1 | one strict pass; no lenient retry |
+| `> 0.50` | 2 | earns the retry that rescues messy-but-real documents |
+
+Both knobs are tunable — `--min-confidence` for the trust threshold, `--max-attempts` for the ceiling — which is exactly what the batch metrics exist to tune against.
 
 ## Use it as a library
 
@@ -98,11 +142,13 @@ src/docpipeline/
 ├── state.py      # DocState: the shared graph state (trace uses an additive reducer)
 ├── engine.py     # pluggable reasoning: RuleBasedEngine (keyless) | OpenAIEngine
 ├── agents.py     # node functions (classify/extract/validate/summarize) + routing
+│                 #   and attempt_budget: confidence → extraction passes
 ├── graph.py      # assembles the StateGraph, conditional edges, retry loop
+├── batch.py      # corpus runner + BatchMetrics
 ├── samples.py    # bundled synthetic documents
 ├── cli.py        # docpipeline command
 └── data/         # sample_docs.jsonl
-tests/            # engine, agents, graph (incl. retry & routing), CLI, samples
+tests/            # engine, agents, graph (incl. retry & routing), batch, CLI, samples
 .github/workflows/ci.yml   # ruff + pytest on Python 3.11 and 3.12
 ```
 
@@ -112,6 +158,8 @@ tests/            # engine, agents, graph (incl. retry & routing), CLI, samples
 - **Validation is code, not a model call.** Checking required fields is deterministic business logic, so it lives in plain Python the tests pin exactly. Only the fuzzy work (classify, extract) is delegated to the engine.
 - **The retry changes behavior, so it can't loop pointlessly.** The second extraction pass enables more lenient patterns (e.g. accepting `CC:`); bounded attempts guarantee termination.
 - **`unknown` is a first-class outcome.** A document that matches nothing is flagged for review, never forced into the closest wrong bucket.
+- **Retries are rationed by confidence, not handed out flat.** A weak classification buys fewer lenient passes — and below the threshold, none at all. Being wrong loudly beats being wrong plausibly.
+- **The batch runner shares one compiled graph.** The pipeline and the bundled engines hold no per-document state, so a corpus can be run across a thread pool; results are returned in input order regardless of completion order.
 
 ## Roadmap
 
@@ -119,9 +167,10 @@ tests/            # engine, agents, graph (incl. retry & routing), CLI, samples
 - [x] Pluggable rule-based (keyless) and OpenAI engines
 - [x] Per-type validation with error/warning distinction
 - [x] CLI + library API, full test suite, CI
+- [x] Confidence-weighted routing and a batch runner with metrics
 - [ ] Streaming/token-level progress via LangGraph events
 - [ ] Human-in-the-loop interrupt on `needs_review` (LangGraph checkpointer)
-- [ ] Confidence-weighted routing and a batch runner with metrics
+- [ ] Per-type confidence thresholds calibrated from batch metrics
 
 ## License
 
