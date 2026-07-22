@@ -76,17 +76,31 @@ docpipeline --dir ./inbox --metrics --workers 8
   completeness: 100% of required fields extracted
 ```
 
-`retried` vs `recovered_by_retry` is the pair worth watching: retries that never recover are pure cost, and the gap between them tells you whether to raise `--max-attempts` or tighten `--min-confidence`. The same numbers are available as data:
+`retried` vs `recovered_by_retry` is the pair worth watching: retries that never recover are pure cost, and the gap between them tells you whether to raise `--max-attempts` or tighten `--min-confidence`.
+
+The aggregate hides the thing you actually act on, though — a 17% review rate is a very different problem when it is one type failing most of the time than when it is every type failing occasionally. So `--metrics` also breaks the run down by type:
+
+```text
+── by type
+  clinical_note      n=2    review=  0%  conf=1.00  passes=1.50  recovered=1/1
+  discharge_summary  n=1    review=  0%  conf=1.00  passes=1.00  recovered=0/0
+  lab_report         n=1    review=  0%  conf=1.00  passes=1.00  recovered=0/0
+  referral           n=1    review=  0%  conf=0.75  passes=1.00  recovered=0/0
+  unknown            n=1    review=100%  conf=0.00  passes=0.00  recovered=0/0
+```
+
+The same numbers are available as data:
 
 ```python
 from docpipeline import run_batch
 
 batch = run_batch(docs, workers=8)          # results stay in input order
 batch.metrics.review_rate                   # 0.1667
+batch.metrics.per_type["lab_report"]        # TypeStats(documents=1, ok=1, ...)
 batch.metrics.as_dict()                     # JSON-ready, with derived rates
 ```
 
-Add `--json --metrics` to get `{"results": [...], "metrics": {...}}` from the CLI. Without `--metrics` the JSON stays a bare list, so existing consumers are unaffected.
+Add `--json --metrics` to get `{"results": [...], "metrics": {...}}` from the CLI. Without a reporting flag the JSON stays a bare list, so existing consumers are unaffected.
 
 ## Confidence-weighted routing
 
@@ -101,6 +115,49 @@ So the budget scales with the classifier's confidence:
 | `> 0.50` | 2 | earns the retry that rescues messy-but-real documents |
 
 Both knobs are tunable — `--min-confidence` for the trust threshold, `--max-attempts` for the ceiling — which is exactly what the batch metrics exist to tune against.
+
+### One threshold per type
+
+The types are not equally separable. A lab report is nearly unmistakable; a discharge summary shares most of its vocabulary with a clinical note. A single global threshold has to be set for the worst type, which means either wasting lenient passes on the easy ones or sending the hard ones to review too eagerly.
+
+So `--min-confidence` is repeatable and accepts `TYPE=VALUE`: set a default, then override only the types that have earned something different.
+
+```bash
+docpipeline --dir ./inbox --min-confidence 0.30 --min-confidence discharge_summary=0.70
+```
+
+The same policy works from the library, as a mapping with an optional `"default"` entry:
+
+```python
+run_batch(docs, min_confidence={"discharge_summary": 0.70, "default": 0.30})
+```
+
+A policy is validated when the pipeline is built, so a mistyped key fails immediately instead of silently doing nothing. `"unknown"` is rejected outright: those documents never reach extraction under any threshold, so a value there could only ever be a no-op — and a knob that does nothing is worse than one that refuses to exist.
+
+### Calibrating those thresholds
+
+Picking per-type numbers by hand is guesswork. `--calibrate` fits them to a run you have already measured:
+
+```bash
+docpipeline --dir ./inbox --calibrate
+```
+
+```text
+── calibration — suggested --min-confidence per type
+  clinical_note      0.35 → 0.35  (unchanged)  [3/5 routed correctly, 3 ok]
+  discharge_summary  0.35 → 0.80  [9/9 routed correctly, 5 ok]
+```
+
+Read the second row as: every discharge summary that scored below 0.80 was headed for review anyway, so extracting them was wasted work — raise the bar and all nine documents get routed correctly.
+
+For each type it fits a one-dimensional decision stump over the observed confidences: a document is *routed correctly* if it scored at or above the threshold and finished `ok`, or scored below it and was headed for review anyway. The threshold with the most correct calls wins — and it must beat the one already in force *strictly*, so a fit that explains the data no better than the status quo is reported as `(unchanged)` rather than dressed up as advice.
+
+It suggests; it never applies. Two reasons, both visible in the output above:
+
+- **Confidence is not always the lever.** A clinical note with no `Plan:` anywhere in it goes to review no matter how confidently it was typed. The `3/5` on the first row is the tell: no threshold separates that type's outcomes, because the failures have nothing to do with classification.
+- **Small samples fit noise.** Types with fewer than three documents are left out entirely rather than calibrated on a handful.
+
+`calibrate_thresholds(results)` returns the same suggestions as data, and `--json --calibrate` puts them under a `"calibration"` key.
 
 ## Use it as a library
 
@@ -144,7 +201,7 @@ src/docpipeline/
 ├── agents.py     # node functions (classify/extract/validate/summarize) + routing
 │                 #   and attempt_budget: confidence → extraction passes
 ├── graph.py      # assembles the StateGraph, conditional edges, retry loop
-├── batch.py      # corpus runner + BatchMetrics
+├── batch.py      # corpus runner, BatchMetrics + TypeStats, threshold calibration
 ├── samples.py    # bundled synthetic documents
 ├── cli.py        # docpipeline command
 └── data/         # sample_docs.jsonl
@@ -159,6 +216,7 @@ tests/            # engine, agents, graph (incl. retry & routing), batch, CLI, s
 - **The retry changes behavior, so it can't loop pointlessly.** The second extraction pass enables more lenient patterns (e.g. accepting `CC:`); bounded attempts guarantee termination.
 - **`unknown` is a first-class outcome.** A document that matches nothing is flagged for review, never forced into the closest wrong bucket.
 - **Retries are rationed by confidence, not handed out flat.** A weak classification buys fewer lenient passes — and below the threshold, none at all. Being wrong loudly beats being wrong plausibly.
+- **Thresholds are per type, and fitted rather than guessed.** The types are not equally separable, so they do not share one number; `--calibrate` derives each from measured outcomes. It suggests rather than applies, and refuses to suggest a change that does not demonstrably route more documents correctly.
 - **The batch runner shares one compiled graph.** The pipeline and the bundled engines hold no per-document state, so a corpus can be run across a thread pool; results are returned in input order regardless of completion order.
 
 ## Roadmap
@@ -168,9 +226,9 @@ tests/            # engine, agents, graph (incl. retry & routing), batch, CLI, s
 - [x] Per-type validation with error/warning distinction
 - [x] CLI + library API, full test suite, CI
 - [x] Confidence-weighted routing and a batch runner with metrics
+- [x] Per-type confidence thresholds calibrated from batch metrics
 - [ ] Streaming/token-level progress via LangGraph events
 - [ ] Human-in-the-loop interrupt on `needs_review` (LangGraph checkpointer)
-- [ ] Per-type confidence thresholds calibrated from batch metrics
 
 ## License
 
