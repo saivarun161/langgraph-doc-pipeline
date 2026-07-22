@@ -1,7 +1,12 @@
 """End-to-end tests that drive the compiled LangGraph pipeline."""
 
+import pytest
+
 from docpipeline.graph import build_pipeline, run_document
 from docpipeline.samples import load_samples
+
+CLEAN_NOTE = "Chief Complaint: cough\nAssessment: bronchitis\nPlan: rest\nPatient Name: Sam Roe"
+CLEAN_LAB = "Patient Name: Sam Roe\nSpecimen: blood\nResults: Hemoglobin 12 g/dL"
 
 
 def test_all_samples_reach_expected_type_and_status():
@@ -66,6 +71,35 @@ def test_retry_budget_scales_with_max_attempts():
     assert run_document(ref["text"])["classification_confidence"] == 0.75
     assert run_document(ref["text"], max_attempts=4)["retry_budget"] == 3
     assert run_document(ref["text"], max_attempts=2)["retry_budget"] == 2
+
+
+def test_per_type_threshold_gates_one_type_without_touching_another():
+    # One policy, two documents that both classify confidently: the note's own
+    # threshold is set above its score, the lab report's is not.
+    policy = {"clinical_note": 1.01, "default": 0.35}
+    note = run_document(CLEAN_NOTE, min_confidence=policy)
+    lab = run_document(CLEAN_LAB, min_confidence=policy)
+
+    assert note.get("attempts", 0) == 0
+    assert note["status"] == "needs_review"
+    assert any("for clinical_note" in e for e in note["errors"])
+
+    assert lab["doc_type"] == "lab_report"
+    assert lab["status"] == "ok"
+    assert lab["attempts"] >= 1
+
+
+def test_per_type_policy_falls_back_to_default_for_unnamed_types():
+    # The policy names only clinical_note, so the lab report is judged by
+    # "default" — set high enough here to stop it.
+    lab = run_document(CLEAN_LAB, min_confidence={"clinical_note": 0.1, "default": 1.01})
+    assert lab.get("attempts", 0) == 0
+    assert lab["status"] == "needs_review"
+
+
+def test_build_pipeline_rejects_a_bad_policy_before_running_anything():
+    with pytest.raises(ValueError, match="unknown document type"):
+        build_pipeline(min_confidence={"lab_reports": 0.5})
 
 
 def test_trace_accumulates_across_nodes():

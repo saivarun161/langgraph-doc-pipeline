@@ -20,7 +20,12 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from .agents import DEFAULT_MAX_ATTEMPTS, DEFAULT_MIN_CONFIDENCE, REQUIRED_FIELDS
+from .agents import (
+    DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_MIN_CONFIDENCE,
+    REQUIRED_FIELDS,
+    ConfidencePolicy,
+)
 from .engine import Engine
 from .graph import build_pipeline, initial_state
 from .state import STATUS_NEEDS_REVIEW, STATUS_OK
@@ -154,7 +159,7 @@ def run_batch(
     docs: Iterable[Mapping[str, Any] | str],
     engine: Engine | None = None,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
-    min_confidence: float = DEFAULT_MIN_CONFIDENCE,
+    min_confidence: ConfidencePolicy = DEFAULT_MIN_CONFIDENCE,
     workers: int = 1,
 ) -> BatchResult:
     """Run every document through one shared pipeline and measure the run.
@@ -163,7 +168,8 @@ def run_batch(
         docs: documents as raw strings, or mappings with ``text`` and optional ``id``.
         engine: reasoning engine (defaults to the keyless rule-based one).
         max_attempts: ceiling on extraction passes per document.
-        min_confidence: classifications below this score skip extraction.
+        min_confidence: classifications below this score skip extraction — one
+            threshold, or a ``{doc_type: threshold}`` mapping.
         workers: thread-pool size. The default of 1 runs documents sequentially;
             raise it when the engine spends its time waiting on a network call.
 

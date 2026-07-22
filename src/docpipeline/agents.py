@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Mapping
 from typing import Any
 
 from .engine import Engine
-from .state import STATUS_NEEDS_REVIEW, STATUS_OK, DocState
+from .state import DOC_TYPES, STATUS_NEEDS_REVIEW, STATUS_OK, DocState
 
 # Ceiling on extraction passes for any single document.
 DEFAULT_MAX_ATTEMPTS = 2
@@ -25,6 +26,17 @@ DEFAULT_MAX_ATTEMPTS = 2
 # The rule-based engine reports a type's share of all keyword hits, so a score
 # below roughly a third means the runner-up types were nearly as plausible.
 DEFAULT_MIN_CONFIDENCE = 0.35
+
+# A confidence policy is either one threshold for every document type, or a
+# mapping of ``doc_type -> threshold`` with an optional ``"default"`` entry
+# covering the types it does not name. Per-type thresholds matter because the
+# types are not equally separable: a lab report is nearly unmistakable, while a
+# discharge summary shares most of its vocabulary with a clinical note, so the
+# confidence at which each becomes trustworthy is different.
+ConfidencePolicy = float | Mapping[str, float]
+
+# The key a mapping policy uses for "every type I did not name".
+POLICY_DEFAULT_KEY = "default"
 
 # Fields every recognized type must carry to be considered complete. Demographic
 # fields (mrn, dob) are treated as warnings, not errors — a document is still
@@ -43,6 +55,46 @@ _DATE_RE = re.compile(r"^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$")
 # --------------------------------------------------------------------------- #
 # Confidence-weighted retry budget
 # --------------------------------------------------------------------------- #
+
+
+def resolve_min_confidence(policy: ConfidencePolicy, doc_type: str) -> float:
+    """The confidence a classification of ``doc_type`` must clear to be extracted.
+
+    A scalar policy applies to every type. A mapping is looked up by type, then
+    by ``"default"``, then falls back to ``DEFAULT_MIN_CONFIDENCE``.
+    """
+    if isinstance(policy, Mapping):
+        if doc_type in policy:
+            return float(policy[doc_type])
+        return float(policy.get(POLICY_DEFAULT_KEY, DEFAULT_MIN_CONFIDENCE))
+    return float(policy)
+
+
+def validate_confidence_policy(policy: ConfidencePolicy) -> ConfidencePolicy:
+    """Check a policy up front and return it, so a typo fails at build time.
+
+    Rejects negative thresholds and keys that name no real document type. An
+    ``"unknown"`` key is rejected too: those documents never reach extraction
+    under any threshold, so a value there would silently do nothing — and a
+    knob that does nothing is worse than one that refuses to exist.
+    """
+    if not isinstance(policy, Mapping):
+        if float(policy) < 0:
+            raise ValueError(f"min_confidence must be >= 0, got {policy}")
+        return policy
+
+    known = {*DOC_TYPES, POLICY_DEFAULT_KEY} - {"unknown"}
+    for key, value in policy.items():
+        if key not in known:
+            reason = (
+                "'unknown' documents never reach extraction, so a threshold there has no effect"
+                if key == "unknown"
+                else f"expected one of {', '.join(sorted(known))}"
+            )
+            raise ValueError(f"unknown document type in min_confidence policy: {key!r} — {reason}")
+        if float(value) < 0:
+            raise ValueError(f"min_confidence for {key!r} must be >= 0, got {value}")
+    return policy
 
 
 def attempt_budget(
@@ -79,10 +131,13 @@ def classify_node(
     state: DocState,
     engine: Engine,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
-    min_confidence: float = DEFAULT_MIN_CONFIDENCE,
+    min_confidence: ConfidencePolicy = DEFAULT_MIN_CONFIDENCE,
 ) -> dict[str, Any]:
     doc_type, confidence = engine.classify(state["raw_text"])
-    budget = attempt_budget(confidence, max_attempts, min_confidence)
+    # The threshold is resolved *after* classification, so it can be specific to
+    # the type the document was actually assigned.
+    threshold = resolve_min_confidence(min_confidence, doc_type)
+    budget = attempt_budget(confidence, max_attempts, threshold)
     out: dict[str, Any] = {
         "doc_type": doc_type,
         "classification_confidence": confidence,
@@ -93,7 +148,8 @@ def classify_node(
     # it carries the document to needs_review with the reason attached.
     if budget == 0 and doc_type != "unknown":
         out["errors"] = [
-            f"classification confidence {confidence:.2f} below threshold {min_confidence:.2f}"
+            f"classification confidence {confidence:.2f} below threshold "
+            f"{threshold:.2f} for {doc_type}"
         ]
         out["trace"].append("classify → below confidence threshold, skipping extraction")
     return out

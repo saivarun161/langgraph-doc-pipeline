@@ -15,11 +15,13 @@ from langgraph.graph import END, START, StateGraph
 from .agents import (
     DEFAULT_MAX_ATTEMPTS,
     DEFAULT_MIN_CONFIDENCE,
+    ConfidencePolicy,
     classify_node,
     extract_node,
     route_after_classify,
     route_after_validate,
     summarize_node,
+    validate_confidence_policy,
     validate_node,
 )
 from .engine import Engine, RuleBasedEngine
@@ -37,7 +39,7 @@ __all__ = [
 def build_pipeline(
     engine: Engine | None = None,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
-    min_confidence: float = DEFAULT_MIN_CONFIDENCE,
+    min_confidence: ConfidencePolicy = DEFAULT_MIN_CONFIDENCE,
 ):
     """Build and compile the document-processing graph.
 
@@ -47,9 +49,13 @@ def build_pipeline(
         max_attempts: ceiling on extraction passes. The actual budget a document
             receives is weighted by its classification confidence.
         min_confidence: classifications below this score are not extracted at
-            all; the document is routed straight to review.
+            all; the document is routed straight to review. Either one threshold
+            for every type, or a ``{doc_type: threshold}`` mapping with an
+            optional ``"default"`` entry — validated here so a mistyped key
+            fails at build time rather than silently doing nothing.
     """
     engine = engine or RuleBasedEngine()
+    validate_confidence_policy(min_confidence)
 
     graph = StateGraph(DocState)
     graph.add_node(
@@ -85,7 +91,7 @@ def run_document(
     doc_id: str = "doc",
     engine: Engine | None = None,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
-    min_confidence: float = DEFAULT_MIN_CONFIDENCE,
+    min_confidence: ConfidencePolicy = DEFAULT_MIN_CONFIDENCE,
 ) -> dict[str, Any]:
     """Convenience wrapper: run one document through a freshly built pipeline and
     return the final state (doc_type, fields, errors, summary, status, trace)."""

@@ -2,18 +2,34 @@ import pytest
 
 from docpipeline.agents import (
     DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_MIN_CONFIDENCE,
     REQUIRED_FIELDS,
     attempt_budget,
     classify_node,
     extract_node,
+    resolve_min_confidence,
     route_after_classify,
     route_after_validate,
     summarize_node,
+    validate_confidence_policy,
     validate_node,
 )
 from docpipeline.engine import RuleBasedEngine
 
 ENGINE = RuleBasedEngine()
+
+
+class FixedEngine:
+    """An engine that classifies everything the same way, for pinning routing."""
+
+    id = "fixed"
+
+    def __init__(self, doc_type, confidence):
+        self._doc_type = doc_type
+        self._confidence = confidence
+
+    def classify(self, text):
+        return self._doc_type, self._confidence
 
 
 def test_classify_node_records_trace():
@@ -71,6 +87,60 @@ def test_attempt_budget_is_monotonic_and_capped():
     budgets = [attempt_budget(c / 20, max_attempts=4) for c in range(21)]
     assert budgets == sorted(budgets)
     assert max(budgets) == 4
+
+
+def test_resolve_min_confidence_scalar_applies_to_every_type():
+    for doc_type in ("clinical_note", "lab_report", "referral"):
+        assert resolve_min_confidence(0.42, doc_type) == 0.42
+
+
+def test_resolve_min_confidence_prefers_the_type_then_default_then_builtin():
+    policy = {"clinical_note": 0.80, "default": 0.20}
+    assert resolve_min_confidence(policy, "clinical_note") == 0.80
+    assert resolve_min_confidence(policy, "lab_report") == 0.20  # falls to "default"
+    assert resolve_min_confidence({"referral": 0.9}, "lab_report") == DEFAULT_MIN_CONFIDENCE
+
+
+def test_classify_node_applies_the_threshold_for_the_assigned_type():
+    # The same 0.60-confidence classification is trusted as a lab report and
+    # rejected as a discharge summary, because the policy names them separately.
+    policy = {"lab_report": 0.50, "discharge_summary": 0.75}
+
+    trusted = classify_node(
+        {"raw_text": "x"}, FixedEngine("lab_report", 0.60), min_confidence=policy
+    )
+    assert trusted["retry_budget"] > 0
+    assert "errors" not in trusted
+
+    rejected = classify_node(
+        {"raw_text": "x"}, FixedEngine("discharge_summary", 0.60), min_confidence=policy
+    )
+    assert rejected["retry_budget"] == 0
+    assert "below threshold 0.75 for discharge_summary" in rejected["errors"][0]
+
+
+def test_validate_confidence_policy_accepts_scalars_and_known_types():
+    assert validate_confidence_policy(0.5) == 0.5
+    policy = {"clinical_note": 0.6, "default": 0.3}
+    assert validate_confidence_policy(policy) == policy
+
+
+def test_validate_confidence_policy_rejects_a_mistyped_type():
+    with pytest.raises(ValueError, match="clinical_notes"):
+        validate_confidence_policy({"clinical_notes": 0.6})
+
+
+def test_validate_confidence_policy_rejects_unknown_as_a_no_op_knob():
+    # 'unknown' documents never extract, so a threshold there would do nothing —
+    # better to fail loudly than to accept a setting that cannot take effect.
+    with pytest.raises(ValueError, match="never reach extraction"):
+        validate_confidence_policy({"unknown": 0.6})
+
+
+@pytest.mark.parametrize("policy", [-0.1, {"lab_report": -1.0}])
+def test_validate_confidence_policy_rejects_negative_thresholds(policy):
+    with pytest.raises(ValueError, match=">= 0"):
+        validate_confidence_policy(policy)
 
 
 def test_extract_node_increments_attempts():
