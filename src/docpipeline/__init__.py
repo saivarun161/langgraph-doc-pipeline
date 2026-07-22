@@ -10,18 +10,29 @@ rule-based engine (the default, so everything runs with no API key) or an
 OpenAI-backed engine for production.
 """
 
-from .batch import BatchMetrics, BatchResult, run_batch, summarize_batch
+from .batch import (
+    BatchMetrics,
+    BatchResult,
+    ThresholdSuggestion,
+    TypeStats,
+    calibrate_thresholds,
+    run_batch,
+    summarize_batch,
+)
 from .graph import build_pipeline, run_document
 from .state import DOC_TYPES, DocState
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "DOC_TYPES",
     "BatchMetrics",
     "BatchResult",
     "DocState",
+    "ThresholdSuggestion",
+    "TypeStats",
     "build_pipeline",
+    "calibrate_thresholds",
     "run_batch",
     "run_document",
     "summarize_batch",

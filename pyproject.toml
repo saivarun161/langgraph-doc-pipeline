@@ -4,8 +4,9 @@ build-backend = "hatchling.build"
 
 [project]
 name = "langgraph-doc-pipeline"
-version = "0.1.0"
-description = "A multi-agent document-processing pipeline built on LangGraph: classify, extract, validate, and summarize unstructured documents through a stateful agent graph with a self-correcting retry loop."
+# Single-sourced from docpipeline.__version__ so the two cannot drift apart.
+dynamic = ["version"]
+description ="A multi-agent document-processing pipeline built on LangGraph: classify, extract, validate, and summarize unstructured documents through a stateful agent graph with a self-correcting retry loop."
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Varun Kammadanam", email = "kammadanamsaivarun@gmail.com" }]
@@ -38,6 +39,9 @@ Issues = "https://github.com/saivarun161/langgraph-doc-pipeline/issues"
 
 [project.scripts]
 docpipeline = "docpipeline.cli:main"
+
+[tool.hatch.version]
+path = "src/docpipeline/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/docpipeline"]

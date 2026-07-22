@@ -3,7 +3,12 @@
 import pytest
 
 from docpipeline import run_batch
-from docpipeline.batch import BatchMetrics, summarize_batch
+from docpipeline.batch import (
+    BatchMetrics,
+    calibrate_thresholds,
+    render_calibration,
+    summarize_batch,
+)
 from docpipeline.samples import load_samples
 
 CLEAN_NOTE = (
@@ -136,3 +141,158 @@ def test_metrics_render_is_human_readable():
     assert "6 document(s)" in text
     assert "needs_review=" in text
     assert "recovered by the retry loop" in text
+
+
+# --------------------------------------------------------------------------- #
+# Per-type breakdown
+# --------------------------------------------------------------------------- #
+
+
+def test_per_type_slices_agree_with_the_batch_totals():
+    m = run_batch(load_samples()).metrics
+    assert sum(s.documents for s in m.per_type.values()) == m.documents
+    assert sum(s.ok for s in m.per_type.values()) == m.ok
+    assert sum(s.needs_review for s in m.per_type.values()) == m.needs_review
+    assert sum(s.retried for s in m.per_type.values()) == m.retried
+    assert sum(s.skipped_extraction for s in m.per_type.values()) == m.skipped_extraction
+
+
+def test_by_type_stays_a_plain_count_map():
+    m = run_batch([CLEAN_NOTE, ABBREV_NOTE, GIBBERISH]).metrics
+    assert m.by_type == {"clinical_note": 2, "unknown": 1}
+
+
+def test_per_type_isolates_the_failing_type():
+    # Two healthy clinical notes and a lab report that cannot pass validation:
+    # the batch review rate is 33%, but it is entirely one type's problem.
+    bad_lab = "Specimen: blood\nCollected: 01/02/2024"
+    m = run_batch([CLEAN_NOTE, ABBREV_NOTE, bad_lab]).metrics
+    assert m.per_type["clinical_note"].review_rate == 0.0
+    assert m.per_type["lab_report"].review_rate == 1.0
+    assert m.per_type["clinical_note"].recovered_by_retry == 1
+
+
+def test_per_type_keys_are_sorted_for_stable_output():
+    m = run_batch([GIBBERISH, CLEAN_NOTE]).metrics
+    assert list(m.per_type) == sorted(m.per_type)
+
+
+def test_per_type_survives_the_json_round_trip():
+    import json
+
+    data = json.loads(json.dumps(run_batch(load_samples()).metrics.as_dict()))
+    assert data["per_type"]["clinical_note"]["documents"] == 2
+    assert 0.0 <= data["per_type"]["clinical_note"]["review_rate"] <= 1.0
+    assert data["by_type"] == {k: v["documents"] for k, v in data["per_type"].items()}
+
+
+def test_render_types_lists_every_type():
+    text = run_batch(load_samples()).metrics.render_types()
+    assert "── by type" in text
+    for doc_type in run_batch(load_samples()).metrics.per_type:
+        assert doc_type in text
+
+
+def test_render_types_handles_an_empty_batch():
+    assert "no documents" in run_batch([]).metrics.render_types()
+
+
+# --------------------------------------------------------------------------- #
+# Threshold calibration
+# --------------------------------------------------------------------------- #
+
+
+def fake_results(doc_type, pairs):
+    """Minimal result dicts: (confidence, status) pairs for one type."""
+    return [
+        {"doc_type": doc_type, "classification_confidence": c, "status": s, "attempts": 1}
+        for c, s in pairs
+    ]
+
+
+def test_calibration_finds_the_separating_threshold():
+    # Everything at 0.8 came out clean; everything at 0.4 went to review. The
+    # threshold that routes all four correctly sits at the lowest good score.
+    results = fake_results(
+        "lab_report",
+        [(0.4, "needs_review"), (0.4, "needs_review"), (0.8, "ok"), (0.8, "ok")],
+    )
+    suggestion = calibrate_thresholds(results)["lab_report"]
+    assert suggestion.threshold == 0.8
+    assert suggestion.correct == 4
+    assert suggestion.accuracy == 1.0
+    assert suggestion.changed is True
+
+
+def test_calibration_prefers_the_lowest_threshold_when_scores_tie():
+    # Every document came out clean, so any threshold at or below the minimum
+    # routes all of them correctly — take the least aggressive one.
+    results = fake_results("referral", [(0.5, "ok"), (0.7, "ok"), (0.9, "ok")])
+    assert calibrate_thresholds(results)["referral"].threshold == 0.5
+
+
+def test_calibration_can_suggest_never_extracting_a_hopeless_type():
+    # Nothing of this type ever finished clean, so the fitted threshold lands
+    # just above the best score it ever produced.
+    results = fake_results(
+        "discharge_summary",
+        [(0.5, "needs_review"), (0.6, "needs_review"), (0.7, "needs_review")],
+    )
+    suggestion = calibrate_thresholds(results)["discharge_summary"]
+    assert suggestion.threshold == 0.71
+    assert suggestion.ok == 0
+
+
+def test_calibration_reports_the_threshold_currently_in_force():
+    results = fake_results("lab_report", [(0.4, "ok"), (0.6, "ok"), (0.8, "ok")])
+    policy = {"lab_report": 0.4, "default": 0.9}
+    assert calibrate_thresholds(results, min_confidence=policy)["lab_report"].current == 0.4
+    assert calibrate_thresholds(results)["lab_report"].current == 0.35  # the built-in default
+
+
+def test_calibration_marks_an_unchanged_threshold():
+    results = fake_results("lab_report", [(0.35, "ok"), (0.6, "ok"), (0.8, "ok")])
+    assert calibrate_thresholds(results, min_confidence=0.35)["lab_report"].changed is False
+
+
+def test_calibration_skips_types_with_too_few_samples():
+    results = fake_results("referral", [(0.5, "ok"), (0.9, "ok")])
+    assert calibrate_thresholds(results, min_samples=3) == {}
+    assert "referral" in calibrate_thresholds(results, min_samples=2)
+
+
+def test_calibration_never_fits_unknown():
+    # 'unknown' documents never reach extraction, so there is no threshold to fit.
+    results = fake_results("unknown", [(0.0, "needs_review")] * 5)
+    assert calibrate_thresholds(results) == {}
+
+
+def test_calibration_on_a_real_batch_stays_within_observed_confidences():
+    results = run_batch(load_samples() * 2).results
+    for doc_type, suggestion in calibrate_thresholds(results).items():
+        observed = [r["classification_confidence"] for r in results if r["doc_type"] == doc_type]
+        assert min(observed) <= suggestion.threshold <= max(observed) + 0.01
+        assert suggestion.correct <= suggestion.documents
+
+
+def test_calibration_suggestion_is_json_serializable():
+    import json
+
+    results = fake_results("lab_report", [(0.4, "needs_review"), (0.8, "ok"), (0.9, "ok")])
+    data = json.loads(
+        json.dumps({k: v.as_dict() for k, v in calibrate_thresholds(results).items()})
+    )
+    assert data["lab_report"]["threshold"] == 0.8
+    assert data["lab_report"]["changed"] is True
+
+
+def test_render_calibration_is_human_readable():
+    results = fake_results("lab_report", [(0.4, "needs_review"), (0.8, "ok"), (0.9, "ok")])
+    text = render_calibration(calibrate_thresholds(results))
+    assert "lab_report" in text
+    assert "0.35 → 0.80" in text
+    assert "routed correctly" in text
+
+
+def test_render_calibration_explains_an_empty_result():
+    assert "no type had" in render_calibration({})
