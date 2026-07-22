@@ -225,10 +225,34 @@ def test_calibration_finds_the_separating_threshold():
 
 
 def test_calibration_prefers_the_lowest_threshold_when_scores_tie():
-    # Every document came out clean, so any threshold at or below the minimum
-    # routes all of them correctly — take the least aggressive one.
-    results = fake_results("referral", [(0.5, "ok"), (0.7, "ok"), (0.9, "ok")])
-    assert calibrate_thresholds(results)["referral"].threshold == 0.5
+    # 0.50, 0.90 and 0.91 all route 3 of these 5 correctly — more than the 2 the
+    # threshold in force manages — so the least aggressive of them wins.
+    results = fake_results(
+        "referral",
+        [
+            (0.2, "needs_review"),
+            (0.5, "ok"),
+            (0.5, "needs_review"),
+            (0.9, "ok"),
+            (0.9, "needs_review"),
+        ],
+    )
+    suggestion = calibrate_thresholds(results, min_confidence=0.1)["referral"]
+    assert suggestion.threshold == 0.5
+    assert suggestion.correct == 3
+
+
+def test_calibration_keeps_the_current_threshold_when_no_fit_beats_it():
+    # Every document scored identically, so confidence cannot explain why two of
+    # them failed. Reporting a change here would dress noise up as advice.
+    results = fake_results(
+        "clinical_note",
+        [(1.0, "ok"), (1.0, "ok"), (1.0, "ok"), (1.0, "needs_review"), (1.0, "needs_review")],
+    )
+    suggestion = calibrate_thresholds(results, min_confidence=0.35)["clinical_note"]
+    assert suggestion.threshold == 0.35
+    assert suggestion.changed is False
+    assert suggestion.correct == 3  # and the 3/5 says confidence is not the lever
 
 
 def test_calibration_can_suggest_never_extracting_a_hopeless_type():
@@ -267,11 +291,15 @@ def test_calibration_never_fits_unknown():
     assert calibrate_thresholds(results) == {}
 
 
-def test_calibration_on_a_real_batch_stays_within_observed_confidences():
+def test_calibration_on_a_real_batch_only_moves_within_observed_confidences():
     results = run_batch(load_samples() * 2).results
-    for doc_type, suggestion in calibrate_thresholds(results).items():
+    suggestions = calibrate_thresholds(results)
+    assert suggestions  # doubling the corpus gives clinical_note enough samples
+    for doc_type, suggestion in suggestions.items():
         observed = [r["classification_confidence"] for r in results if r["doc_type"] == doc_type]
-        assert min(observed) <= suggestion.threshold <= max(observed) + 0.01
+        assert not suggestion.changed or (
+            min(observed) <= suggestion.threshold <= max(observed) + 0.01
+        )
         assert suggestion.correct <= suggestion.documents
 
 

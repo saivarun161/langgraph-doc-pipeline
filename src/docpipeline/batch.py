@@ -280,8 +280,11 @@ def calibrate_thresholds(
     classification confidences: for every candidate threshold ``t``, a document
     is *called correctly* if it scored at or above ``t`` and finished ``ok``, or
     scored below ``t`` and would have been sent to review regardless. The
-    threshold with the most correct calls wins; ties go to the lowest one, since
-    the least aggressive threshold that explains the data is the safer choice.
+    threshold with the most correct calls wins, and it must beat the threshold
+    already in force *strictly* — a fit that explains the data no better than
+    the status quo is reported as unchanged rather than dressed up as advice.
+    That also settles ties toward the lowest threshold, which is the safer
+    choice when several explain the data equally well.
 
     Candidates are the confidences actually observed for that type, plus one
     just above the highest — which expresses "stop extracting this type at all".
@@ -315,19 +318,27 @@ def calibrate_thresholds(
             (float(r.get("classification_confidence", 0.0)), r.get("status") == STATUS_OK)
             for r in subset
         ]
+
+        def routed_correctly(threshold: float, samples: list[tuple[float, bool]] = samples) -> int:
+            return sum(1 for confidence, ok in samples if (confidence >= threshold) == ok)
+
         confidences = sorted({confidence for confidence, _ in samples})
         candidates = [*confidences, round(confidences[-1] + 0.01, 4)]
 
-        best, best_correct = candidates[0], -1
+        # Start from the threshold already in force and only move off it for a
+        # strict improvement. A fit that routes no more documents correctly than
+        # the status quo is not a recommendation — and since candidates ascend,
+        # requiring strictly-better also settles ties toward the lowest.
+        current = resolve_min_confidence(min_confidence, doc_type)
+        best, best_correct = current, routed_correctly(current)
         for candidate in candidates:
-            correct = sum(1 for confidence, ok in samples if (confidence >= candidate) == ok)
-            if correct > best_correct:
+            if (correct := routed_correctly(candidate)) > best_correct:
                 best, best_correct = candidate, correct
 
         suggestions[doc_type] = ThresholdSuggestion(
             doc_type=doc_type,
             threshold=round(best, 2),
-            current=round(resolve_min_confidence(min_confidence, doc_type), 2),
+            current=round(current, 2),
             documents=len(subset),
             ok=sum(1 for _, ok in samples if ok),
             correct=best_correct,
