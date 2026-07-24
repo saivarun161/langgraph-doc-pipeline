@@ -231,3 +231,47 @@ def test_cli_calibrate_alone_wraps_results_without_a_metrics_key(monkeypatch, ca
     assert len(payload["results"]) == 6
     assert "calibration" in payload
     assert "metrics" not in payload
+
+
+def test_cli_stream_prints_nodes_before_the_result(monkeypatch, capsys, tmp_path):
+    doc = tmp_path / "note.txt"
+    doc.write_text(
+        "Patient Name: Aisha Khan\nCC: Shortness of breath\nAssessment: asthma\nPlan: inhaler"
+    )
+    run_cli(monkeypatch, ["--file", str(doc), "--stream"])
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    # The header comes first, then one timestamped line per node, and the
+    # finished record only after the nodes that produced it.
+    assert lines[0] == "── note — streaming"
+    assert "classify → clinical_note" in lines[1]
+    node_lines = [i for i, line in enumerate(lines) if line.startswith("    [")]
+    result_line = lines.index("── note — type=clinical_note status=ok")
+    assert max(node_lines) < result_line
+    # The retry is visible as it happens.
+    assert sum(1 for line in lines if "extract" in line and line.startswith("    [")) == 2
+    assert "Processed 1 document(s); 0 flagged for review." in out
+
+
+def test_cli_stream_does_not_repeat_the_trace_under_the_result(monkeypatch, capsys, tmp_path):
+    doc = tmp_path / "note.txt"
+    doc.write_text("Patient Name: Sam Roe\nChief Complaint: cough\nAssessment: b\nPlan: rest")
+    run_cli(monkeypatch, ["--file", str(doc), "--stream"])
+    out = capsys.readouterr().out
+    assert "  trace:" not in out
+    assert out.count("summarize → status=ok") == 1
+
+
+def test_cli_stream_still_reports_metrics(monkeypatch, capsys, tmp_path):
+    root = write_docs(tmp_path)
+    run_cli(monkeypatch, ["--dir", str(root), "--stream", "--metrics"])
+    out = capsys.readouterr().out
+    assert "── batch — 3 document(s)" in out
+    assert "── by type" in out
+
+
+def test_cli_stream_rejects_json_and_multiple_workers(monkeypatch):
+    with pytest.raises(SystemExit):
+        run_cli(monkeypatch, ["--samples", "--stream", "--json"])
+    with pytest.raises(SystemExit):
+        run_cli(monkeypatch, ["--samples", "--stream", "--workers", "4"])

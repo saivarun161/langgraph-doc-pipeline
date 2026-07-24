@@ -170,4 +170,3 @@ def stream_document(
         engine=engine, max_attempts=max_attempts, min_confidence=min_confidence
     )
     yield from stream_pipeline(pipeline, text, doc_id)
-

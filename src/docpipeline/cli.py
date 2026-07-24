@@ -8,6 +8,7 @@ docpipeline --samples --json          # machine-readable output
 docpipeline --dir ./inbox --metrics --workers 8   # batch with aggregate metrics
 docpipeline --dir ./inbox --calibrate             # suggest per-type thresholds
 docpipeline --dir ./inbox --min-confidence 0.3 --min-confidence lab_report=0.7
+docpipeline --samples --stream        # watch each node land as it happens
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -25,15 +27,17 @@ from .agents import (
     ConfidencePolicy,
     validate_confidence_policy,
 )
-from .batch import calibrate_thresholds, render_calibration, run_batch
-from .engine import get_engine
+from .batch import calibrate_thresholds, render_calibration, run_batch, summarize_batch
+from .engine import Engine, get_engine
+from .graph import build_pipeline
 from .samples import load_samples
+from .stream import stream_pipeline
 
 # Extensions treated as documents when reading a directory.
 DOC_SUFFIXES = (".txt", ".md")
 
 
-def _render(result: dict[str, Any]) -> str:
+def _render(result: dict[str, Any], show_trace: bool = True) -> str:
     lines = [
         f"── {result.get('doc_id', 'doc')} — type={result.get('doc_type')} "
         f"status={result.get('status')}"
@@ -46,9 +50,47 @@ def _render(result: dict[str, Any]) -> str:
     if warnings := result.get("warnings"):
         lines.append(f"  warnings: {warnings}")
     lines.append(f"  summary: {result.get('summary')}")
-    lines.append("  trace:")
-    lines.extend(f"    • {step}" for step in result.get("trace", []))
+    # Streaming already printed the trace live, node by node; repeating it under
+    # the result would just be the same lines a second time.
+    if show_trace:
+        lines.append("  trace:")
+        lines.extend(f"    • {step}" for step in result.get("trace", []))
     return "\n".join(lines)
+
+
+def _stream_docs(
+    docs: list[dict[str, str]],
+    engine: Engine,
+    max_attempts: int,
+    min_confidence: ConfidencePolicy,
+) -> tuple[list[dict[str, Any]], float]:
+    """Run documents one at a time, printing each node as it lands.
+
+    Returns the same per-document results the batch runner would, plus the wall
+    time, so the metrics and calibration blocks are computed from streamed runs
+    exactly as they are from batched ones. The pipeline is compiled once and
+    reused, which is also why this does not simply call ``run_batch``: the point
+    is to emit output *during* a document, not after it.
+    """
+    pipeline = build_pipeline(
+        engine=engine, max_attempts=max_attempts, min_confidence=min_confidence
+    )
+    results: list[dict[str, Any]] = []
+
+    started = time.perf_counter()
+    for doc in docs:
+        doc_id = doc["id"]
+        print(f"── {doc_id} — streaming", flush=True)
+        state: dict[str, Any] = {}
+        for event in stream_pipeline(pipeline, doc["text"], doc_id):
+            print(event.render(), flush=True)
+            state = event.state
+        results.append(state)
+        print(_render(state, show_trace=False))
+        print()
+    elapsed = time.perf_counter() - started
+
+    return results, elapsed
 
 
 def _read_directory(root: Path) -> list[dict[str, str]]:
@@ -140,6 +182,11 @@ def main() -> None:
         help=f"ceiling on extraction passes per document (default: {DEFAULT_MAX_ATTEMPTS})",
     )
     parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="print each pipeline node as it completes, instead of only the finished result",
+    )
+    parser.add_argument(
         "--calibrate",
         action="store_true",
         help="suggest a per-type --min-confidence fitted to this run's outcomes",
@@ -161,17 +208,30 @@ def main() -> None:
         parser.error("--workers must be >= 1")
     if args.max_attempts < 1:
         parser.error("--max-attempts must be >= 1")
+    # Streaming is a live view of one document at a time. Interleaving several
+    # documents' nodes would make the order meaningless, and JSON cannot be
+    # emitted progressively without changing what --json means.
+    if args.stream and args.as_json:
+        parser.error("--stream is a live text view and cannot be combined with --json")
+    if args.stream and args.workers > 1:
+        parser.error("--stream processes one document at a time; --workers must be 1")
     min_confidence = _parse_confidence_policy(args.min_confidence, parser)
 
     docs = _collect_docs(args, parser)
-    batch = run_batch(
-        docs,
-        engine=get_engine(args.engine),
-        max_attempts=args.max_attempts,
-        min_confidence=min_confidence,
-        workers=args.workers,
-    )
-    results = batch.results
+    engine = get_engine(args.engine)
+
+    if args.stream:
+        results, elapsed = _stream_docs(docs, engine, args.max_attempts, min_confidence)
+        metrics = summarize_batch(results, elapsed)
+    else:
+        batch = run_batch(
+            docs,
+            engine=engine,
+            max_attempts=args.max_attempts,
+            min_confidence=min_confidence,
+            workers=args.workers,
+        )
+        results, metrics = batch.results, batch.metrics
     suggestions = calibrate_thresholds(results, min_confidence) if args.calibrate else {}
 
     if args.as_json:
@@ -182,21 +242,23 @@ def main() -> None:
         if args.metrics or args.calibrate:
             payload = {"results": serializable}
             if args.metrics:
-                payload["metrics"] = batch.metrics.as_dict()
+                payload["metrics"] = metrics.as_dict()
             if args.calibrate:
                 payload["calibration"] = {k: v.as_dict() for k, v in suggestions.items()}
         print(json.dumps(payload, indent=2, default=str))
     else:
-        for result in results:
-            print(_render(result))
-            print()
+        # A streamed run has already printed each document as it went.
+        if not args.stream:
+            for result in results:
+                print(_render(result))
+                print()
         flagged = sum(1 for r in results if r.get("status") == "needs_review")
         print(f"Processed {len(results)} document(s); {flagged} flagged for review.")
         if args.metrics:
             print()
-            print(batch.metrics.render())
+            print(metrics.render())
             print()
-            print(batch.metrics.render_types())
+            print(metrics.render_types())
         if args.calibrate:
             print()
             print(render_calibration(suggestions))
