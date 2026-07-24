@@ -159,6 +159,55 @@ It suggests; it never applies. Two reasons, both visible in the output above:
 
 `calibrate_thresholds(results)` returns the same suggestions as data, and `--json --calibrate` puts them under a `"calibration"` key.
 
+## Watching a run live
+
+The trace explains a document once it is finished. That is the wrong shape when
+someone is waiting on the run — the interesting moment is *the retry firing*,
+not the record that it fired. `--stream` prints each node as it lands, stamped
+with how far into the run it happened:
+
+```bash
+docpipeline --dir ./inbox --stream
+```
+
+```text
+── note-02-abbrev — streaming
+    [ 0.000s] classify → clinical_note (confidence 1.00, budget 2)
+    [ 0.000s] extract → 5 field(s): assessment, dob, mrn, patient_name, plan
+    [ 0.001s] validate → 1 error(s), 0 warning(s)
+    [ 0.001s] extract (retry 1) → 6 field(s): assessment, chief_complaint, dob, mrn, patient_name, plan
+    [ 0.001s] validate → clean, 0 warning(s)
+    [ 0.001s] summarize → status=ok
+── note-02-abbrev — type=clinical_note status=ok
+  fields:
+    ...
+```
+
+The finished record follows, without repeating the trace that was just printed
+line by line. `--metrics` and `--calibrate` work the same as in a batch run;
+`--json` and `--workers > 1` do not, and say so — JSON cannot be emitted
+progressively without changing what `--json` means, and interleaving several
+documents' nodes would make the order meaningless.
+
+The same events are available as data, one per node completion:
+
+```python
+from docpipeline import stream_document
+
+for event in stream_document(text):
+    print(event.node, event.visit, event.lines)   # 'extract' 2 ('extract (retry 1) → ...',)
+    if event.is_final:
+        result = event.state                      # == run_document(text)
+```
+
+`visit` is the cheapest way to spot a self-correction: the retry loop is the
+only thing that takes a node past its first visit. Each event also carries an
+accumulated `state` snapshot — immutable, so an event handed to a consumer keeps
+showing the state as of that node — which means the last one *is* the result. A
+caller never has to choose between watching the run and getting its outcome.
+`stream_pipeline(pipeline, text, doc_id)` takes an already-compiled graph, for
+streaming a whole corpus off one build.
+
 ## Use it as a library
 
 ```python
@@ -202,10 +251,11 @@ src/docpipeline/
 │                 #   and attempt_budget: confidence → extraction passes
 ├── graph.py      # assembles the StateGraph, conditional edges, retry loop
 ├── batch.py      # corpus runner, BatchMetrics + TypeStats, threshold calibration
+├── stream.py     # PipelineEvent: node-by-node progress off LangGraph's update stream
 ├── samples.py    # bundled synthetic documents
 ├── cli.py        # docpipeline command
 └── data/         # sample_docs.jsonl
-tests/            # engine, agents, graph (incl. retry & routing), batch, CLI, samples
+tests/            # engine, agents, graph (incl. retry & routing), batch, stream, CLI, samples
 .github/workflows/ci.yml   # ruff + pytest on Python 3.11 and 3.12
 ```
 
@@ -217,6 +267,7 @@ tests/            # engine, agents, graph (incl. retry & routing), batch, CLI, s
 - **`unknown` is a first-class outcome.** A document that matches nothing is flagged for review, never forced into the closest wrong bucket.
 - **Retries are rationed by confidence, not handed out flat.** A weak classification buys fewer lenient passes — and below the threshold, none at all. Being wrong loudly beats being wrong plausibly.
 - **Thresholds are per type, and fitted rather than guessed.** The types are not equally separable, so they do not share one number; `--calibrate` derives each from measured outcomes. It suggests rather than applies, and refuses to suggest a change that does not demonstrably route more documents correctly.
+- **Streaming is a view of the run, not a second code path.** The events come off LangGraph's own update stream, and the state they accumulate is asserted equal to what `run_document` returns for every bundled document. Progress reporting that can disagree with the result is worse than none.
 - **The batch runner shares one compiled graph.** The pipeline and the bundled engines hold no per-document state, so a corpus can be run across a thread pool; results are returned in input order regardless of completion order.
 
 ## Roadmap
@@ -227,7 +278,7 @@ tests/            # engine, agents, graph (incl. retry & routing), batch, CLI, s
 - [x] CLI + library API, full test suite, CI
 - [x] Confidence-weighted routing and a batch runner with metrics
 - [x] Per-type confidence thresholds calibrated from batch metrics
-- [ ] Streaming/token-level progress via LangGraph events
+- [x] Streaming node-by-node progress via LangGraph events (`--stream`, `stream_document`)
 - [ ] Human-in-the-loop interrupt on `needs_review` (LangGraph checkpointer)
 
 ## License
