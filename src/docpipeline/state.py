@@ -25,6 +25,14 @@ DOC_TYPES = (
 STATUS_OK = "ok"
 STATUS_NEEDS_REVIEW = "needs_review"
 
+# Channels whose node updates accumulate instead of replacing what is there.
+# LangGraph applies these reducers itself when it runs the graph; the streaming
+# layer has to reproduce them by hand, because it merges the per-node updates as
+# they arrive rather than waiting for the final state. Named here, next to the
+# annotations they mirror, so the two cannot quietly drift apart — a test pins
+# that this tuple matches the reducers declared on ``DocState``.
+ADDITIVE_CHANNELS = ("trace",)
+
 
 class DocState(TypedDict, total=False):
     # --- input ---

@@ -21,19 +21,23 @@ from .batch import (
 )
 from .graph import build_pipeline, run_document
 from .state import DOC_TYPES, DocState
+from .stream import PipelineEvent, stream_document, stream_pipeline
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "DOC_TYPES",
     "BatchMetrics",
     "BatchResult",
     "DocState",
+    "PipelineEvent",
     "ThresholdSuggestion",
     "TypeStats",
     "build_pipeline",
     "calibrate_thresholds",
     "run_batch",
     "run_document",
+    "stream_document",
+    "stream_pipeline",
     "summarize_batch",
 ]
